@@ -16,6 +16,7 @@ from layers import LayerStack
 from tools import Selection, Tool, ToolContext, ToolKind, create_tool
 from brushes import Brush, BrushManager
 from icons import icon
+from sprite_sheet import SpriteSheetInfo
 
 VERTEX_SHADER = """
 #version 330 core
@@ -74,6 +75,8 @@ class PixelCanvas(QOpenGLWidget):
     zoom_changed = Signal(float)
     transform_requested = Signal()
     brush_created = Signal()
+    undo_requested = Signal()
+    redo_requested = Signal()
 
     GRID_VISIBLE_ZOOM_THRESHOLD = 8.0  # 800%
     TILE_PREVIEW_ALPHA = 0.35
@@ -102,6 +105,7 @@ class PixelCanvas(QOpenGLWidget):
         self.selection: Selection | None = None
         self._lasso_points: list[tuple[int, int]] | None = None
         self._clipboard: dict | None = None
+        self.sprite_sheet: SpriteSheetInfo | None = None
 
         self.pencil_size = 1
         self.pencil_brush = Brush.solid_square(1)
@@ -190,6 +194,26 @@ class PixelCanvas(QOpenGLWidget):
         self.zoom_pct_label.mousePressEvent = lambda e: self._step_zoom(1.0 / self.zoom)
         layout.addWidget(self.zoom_pct_label)
 
+        separator = QLabel("|")
+        separator.setStyleSheet("color: #55555a;")
+        layout.addWidget(separator)
+
+        self.undo_btn = QToolButton()
+        self.undo_btn.setIcon(icon("undo"))
+        self.undo_btn.setIconSize(QSize(14, 14))
+        self.undo_btn.setFixedSize(22, 22)
+        self.undo_btn.setToolTip("Undo")
+        self.undo_btn.clicked.connect(self.undo_requested.emit)
+        layout.addWidget(self.undo_btn)
+
+        self.redo_btn = QToolButton()
+        self.redo_btn.setIcon(icon("redo"))
+        self.redo_btn.setIconSize(QSize(14, 14))
+        self.redo_btn.setFixedSize(22, 22)
+        self.redo_btn.setToolTip("Redo")
+        self.redo_btn.clicked.connect(self.redo_requested.emit)
+        layout.addWidget(self.redo_btn)
+
         self.zoom_bar.adjustSize()
 
     def _step_zoom(self, factor: float) -> None:
@@ -227,6 +251,27 @@ class PixelCanvas(QOpenGLWidget):
 
     def set_grid_enabled(self, enabled: bool) -> None:
         self.grid_enabled = enabled
+        self.update()
+
+    def set_sprite_sheet(self, sheet: SpriteSheetInfo | None) -> None:
+        self.sprite_sheet = sheet
+        self.update()
+
+    def focus_on_frame(self, col: int, row: int) -> None:
+        """Zoom/pan so a single sprite-sheet frame fills most of the viewport,
+        for focused per-frame editing."""
+        if self.sprite_sheet is None:
+            return
+        x0, y0, x1, y1 = self.sprite_sheet.frame_rect(col, row)
+        fw, fh = x1 - x0, y1 - y0
+        margin = 0.85
+        zx = self.width() / max(fw, 1) * margin
+        zy = self.height() / max(fh, 1) * margin
+        self.zoom = float(np.clip(min(zx, zy), 0.25, 64.0))
+        cw, ch = self.layers.width, self.layers.height
+        frame_cx, frame_cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        self.pan = QPointF(frame_cx - cw / 2.0, frame_cy - ch / 2.0)
+        self.zoom_changed.emit(self.zoom)
         self.update()
 
     def set_navigator_visible(self, visible: bool) -> None:
@@ -363,6 +408,9 @@ class PixelCanvas(QOpenGLWidget):
         if self.grid_enabled and self.zoom > self.GRID_VISIBLE_ZOOM_THRESHOLD:
             self._draw_pixel_grid(mvp, cw, ch)
 
+        if self.sprite_sheet is not None:
+            self._draw_sprite_sheet_grid(mvp)
+
         if self.selection is not None and not self.selection.is_empty():
             self._draw_selection_outline(mvp)
 
@@ -439,6 +487,38 @@ class PixelCanvas(QOpenGLWidget):
         GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 8, ctypes.c_void_p(0))
         GL.glDrawArrays(GL.GL_LINES, 0, len(lines) // 2)
         GL.glBindVertexArray(0)
+
+    def _draw_sprite_sheet_grid(self, mvp: np.ndarray) -> None:
+        """Thicker, high-contrast frame boundaries subdividing the canvas into
+        sprite-sheet cells, always visible regardless of zoom level."""
+        sheet = self.sprite_sheet
+        lines = []
+        for row in range(sheet.rows):
+            for col in range(sheet.columns):
+                x0, y0, x1, y1 = sheet.frame_rect(col, row)
+                lines += [
+                    x0, y0, x1, y0,
+                    x1, y0, x1, y1,
+                    x1, y1, x0, y1,
+                    x0, y1, x0, y0,
+                ]
+        verts = np.array(lines, dtype=np.float32)
+
+        GL.glUseProgram(self._grid_program)
+        loc = GL.glGetUniformLocation(self._grid_program, "u_mvp")
+        GL.glUniformMatrix4fv(loc, 1, GL.GL_FALSE, mvp)
+        color_loc = GL.glGetUniformLocation(self._grid_program, "u_color")
+        GL.glUniform4f(color_loc, 1.0, 0.55, 0.15, 0.9)
+
+        GL.glLineWidth(2.0)
+        GL.glBindVertexArray(self._grid_vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._grid_vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, verts.nbytes, verts, GL.GL_DYNAMIC_DRAW)
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 8, ctypes.c_void_p(0))
+        GL.glDrawArrays(GL.GL_LINES, 0, len(lines) // 2)
+        GL.glBindVertexArray(0)
+        GL.glLineWidth(1.0)
 
     def _draw_selection_outline(self, mvp: np.ndarray) -> None:
         if self._lasso_points is not None and len(self._lasso_points) >= 2:
@@ -543,6 +623,14 @@ class PixelCanvas(QOpenGLWidget):
         if self._stroke_active:
             x, y = self.widget_to_pixel(event.position())
             self._end_stroke(x, y)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self.sprite_sheet is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = self.widget_to_pixel(event.position())
+        frame = self.sprite_sheet.frame_at_pixel(x, y)
+        if frame is not None:
+            self.focus_on_frame(*frame)
 
     def enterEvent(self, event) -> None:
         self.tool_label.show()
@@ -679,49 +767,53 @@ class PixelCanvas(QOpenGLWidget):
 
     def contextMenuEvent(self, event) -> None:
         has_selection = self.selection is not None and not self.selection.is_empty()
+        has_clipboard = self._clipboard is not None
+
+        # Only ever show actions that actually do something right now, grouped
+        # with separators — instead of listing everything and graying out
+        # whatever doesn't apply to the current selection/clipboard state.
+        groups: list[list[tuple[str, "callable"]]] = []
+
+        edit_group = []
+        if has_selection:
+            edit_group.append(("Copy", self._copy_selection))
+            edit_group.append(("Cut", self._cut_selection))
+        if has_clipboard:
+            edit_group.append(("Paste", self._paste_clipboard))
+        if edit_group:
+            groups.append(edit_group)
+
+        transform_group = []
+        if has_selection:
+            transform_group.append(("Flip Horizontal", lambda: self._flip_selection(axis=1)))
+            transform_group.append(("Flip Vertical", lambda: self._flip_selection(axis=0)))
+            transform_group.append(("Rotate 90° CW", self._rotate_selection_90))
+            transform_group.append(("Transform...", self.transform_requested.emit))
+        if transform_group:
+            groups.append(transform_group)
+
+        selection_group = []
+        if has_selection:
+            selection_group.append(("Deselect", self.clear_selection))
+            selection_group.append(("Create Brush from Selection", self._create_brush_from_selection))
+        if selection_group:
+            groups.append(selection_group)
+
+        if not groups:
+            return
+
         menu = QMenu(self)
-        copy_act = menu.addAction("Copy")
-        copy_act.setEnabled(has_selection)
-        cut_act = menu.addAction("Cut")
-        cut_act.setEnabled(has_selection)
-        paste_act = menu.addAction("Paste")
-        paste_act.setEnabled(self._clipboard is not None)
-        menu.addSeparator()
-        flip_h_act = menu.addAction("Flip Horizontal")
-        flip_h_act.setEnabled(has_selection)
-        flip_v_act = menu.addAction("Flip Vertical")
-        flip_v_act.setEnabled(has_selection)
-        rotate_act = menu.addAction("Rotate 90° CW")
-        rotate_act.setEnabled(has_selection)
-        menu.addSeparator()
-        transform_act = menu.addAction("Transform...")
-        transform_act.setEnabled(has_selection)
-        menu.addSeparator()
-        deselect_act = menu.addAction("Deselect")
-        deselect_act.setEnabled(has_selection)
-        menu.addSeparator()
-        create_brush_act = menu.addAction("Create Brush from Selection")
-        create_brush_act.setEnabled(has_selection)
+        handlers: dict = {}
+        for i, group in enumerate(groups):
+            if i > 0:
+                menu.addSeparator()
+            for label, handler in group:
+                action = menu.addAction(label)
+                handlers[action] = handler
 
         chosen = menu.exec(event.globalPos())
-        if chosen == copy_act:
-            self._copy_selection()
-        elif chosen == cut_act:
-            self._cut_selection()
-        elif chosen == paste_act:
-            self._paste_clipboard()
-        elif chosen == flip_h_act:
-            self._flip_selection(axis=1)
-        elif chosen == flip_v_act:
-            self._flip_selection(axis=0)
-        elif chosen == rotate_act:
-            self._rotate_selection_90()
-        elif chosen == transform_act:
-            self.transform_requested.emit()
-        elif chosen == deselect_act:
-            self.clear_selection()
-        elif chosen == create_brush_act:
-            self._create_brush_from_selection()
+        if chosen in handlers:
+            handlers[chosen]()
 
     def _commit_edit(self, before: np.ndarray, after: np.ndarray) -> None:
         if self._on_stroke_committed and not np.array_equal(before, after):
@@ -735,7 +827,7 @@ class PixelCanvas(QOpenGLWidget):
         region = layer.pixels[y0:y1, x0:x1].copy()
         mask = self.selection.mask[y0:y1, x0:x1].copy()
         region[~mask] = 0
-        self._clipboard = {"pixels": region, "mask": mask}
+        self._clipboard = {"pixels": region, "mask": mask, "origin": (x0, y0)}
 
     def _cut_selection(self) -> None:
         if self.selection is None or self.selection.is_empty():
@@ -754,8 +846,11 @@ class PixelCanvas(QOpenGLWidget):
         before = layer.pixels.copy()
         clip_pixels, clip_mask = self._clipboard["pixels"], self._clipboard["mask"]
         h, w = clip_pixels.shape[:2]
-        cx, cy = self._hover_pixel or (self.layers.width // 2, self.layers.height // 2)
-        x0, y0 = cx - w // 2, cy - h // 2
+        # Paste back at the exact spot it was copied/cut from by default (like
+        # every other editor's plain Paste), rather than re-centering on wherever
+        # the mouse happens to be hovering (which can even be nowhere, e.g. right
+        # after using the right-click context menu).
+        x0, y0 = self._clipboard["origin"]
 
         lh, lw = layer.pixels.shape[:2]
         dst_x0, dst_y0 = max(0, x0), max(0, y0)

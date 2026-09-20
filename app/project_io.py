@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage
 
 from layers import Layer, LayerStack, BlendMode
 from palette import Palette
+from sprite_sheet import SpriteSheetInfo
 
 MANIFEST_NAME = "manifest.json"
 FORMAT_VERSION = 1
@@ -33,7 +34,13 @@ def _decode_png(data: bytes) -> np.ndarray:
     return np.frombuffer(ptr, dtype=np.uint8, count=h * w * 4).reshape((h, w, 4)).copy()
 
 
-def save_project(path: str, layer_stack: LayerStack, palette: Palette, project_name: str = "Untitled") -> None:
+def save_project(
+    path: str,
+    layer_stack: LayerStack,
+    palette: Palette,
+    project_name: str = "Untitled",
+    sprite_sheet: SpriteSheetInfo | None = None,
+) -> None:
     manifest = {
         "format_version": FORMAT_VERSION,
         "project_name": project_name,
@@ -53,6 +60,7 @@ def save_project(path: str, layer_stack: LayerStack, palette: Palette, project_n
         ],
         "palette_name": palette.name,
         "palette_colors": palette.colors,
+        "sprite_sheet": sprite_sheet.to_dict() if sprite_sheet else None,
     }
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -61,7 +69,7 @@ def save_project(path: str, layer_stack: LayerStack, palette: Palette, project_n
             zf.writestr(f"layer_{i}.png", _encode_png(layer.pixels))
 
 
-def load_project(path: str) -> tuple[LayerStack, Palette, str]:
+def load_project(path: str) -> tuple[LayerStack, Palette, str, SpriteSheetInfo | None]:
     with zipfile.ZipFile(path, "r") as zf:
         manifest = json.loads(zf.read(MANIFEST_NAME).decode("utf-8"))
 
@@ -85,5 +93,7 @@ def load_project(path: str) -> tuple[LayerStack, Palette, str]:
             colors=[tuple(c) for c in manifest.get("palette_colors", [])],
         )
         project_name = manifest.get("project_name", "Untitled")
+        sheet_data = manifest.get("sprite_sheet")
+        sprite_sheet = SpriteSheetInfo.from_dict(sheet_data) if sheet_data else None
 
-    return stack, palette, project_name
+    return stack, palette, project_name, sprite_sheet

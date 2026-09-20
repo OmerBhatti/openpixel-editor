@@ -1,0 +1,6 @@
+{
+  "command": "python",
+  "args": [
+    "app/mcp_server.py"
+  ]
+}

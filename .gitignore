@@ -31,3 +31,6 @@ Thumbs.db
 # Logs / temp
 *.log
 _test_*.py
+
+# Local MCP config (machine-specific absolute paths)
+.mcp.json

@@ -109,6 +109,88 @@ def auto_clean_double_pixels(image: np.ndarray, mask: np.ndarray | None = None) 
     return out
 
 
+def _box_sum(arr: np.ndarray, radius: int, axis: int) -> np.ndarray:
+    """Sliding-window sum of width (2*radius+1) along `axis`, via padded cumsum."""
+    pad_width = [(0, 0)] * arr.ndim
+    pad_width[axis] = (radius, radius)
+    padded = np.pad(arr, pad_width, mode="edge")
+    csum = np.cumsum(padded, axis=axis)
+    zero_shape = list(csum.shape)
+    zero_shape[axis] = 1
+    csum = np.concatenate([np.zeros(zero_shape, dtype=csum.dtype), csum], axis=axis)
+    n = arr.shape[axis]
+    hi = [slice(None)] * arr.ndim
+    lo = [slice(None)] * arr.ndim
+    hi[axis] = slice(2 * radius + 1, 2 * radius + 1 + n)
+    lo[axis] = slice(0, n)
+    return csum[tuple(hi)] - csum[tuple(lo)]
+
+
+def box_blur(image: np.ndarray, radius: int = 1) -> np.ndarray:
+    """Alpha-aware box blur: colors are premultiplied by alpha before averaging
+    and un-premultiplied afterward, so transparent neighbors don't darken edges.
+    """
+    if radius <= 0:
+        return image.copy()
+    alpha = image[..., 3:4].astype(np.float32)
+    premult_rgb = image[..., :3].astype(np.float32) * (alpha / 255.0)
+
+    rgb_sum = _box_sum(_box_sum(premult_rgb, radius, axis=0), radius, axis=1)
+    alpha_sum = _box_sum(_box_sum(alpha, radius, axis=0), radius, axis=1)
+    kernel_area = float((2 * radius + 1) ** 2)
+
+    out_alpha = alpha_sum / kernel_area
+    safe_alpha_sum = np.where(alpha_sum == 0, 1.0, alpha_sum)
+    out_rgb = rgb_sum / safe_alpha_sum * 255.0
+
+    out = np.concatenate([out_rgb, out_alpha], axis=-1)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)
+
+
+def sharpen(image: np.ndarray, amount: float = 1.0, radius: int = 1) -> np.ndarray:
+    """Unsharp-mask sharpening: pushes each pixel away from its local blurred
+    average, boosting edge contrast (useful for crisping up hand-painted shading).
+    """
+    blurred = box_blur(image, radius).astype(np.float32)
+    orig = image.astype(np.float32)
+    sharpened_rgb = orig[..., :3] + amount * (orig[..., :3] - blurred[..., :3])
+    out = image.copy()
+    out[..., :3] = np.clip(sharpened_rgb + 0.5, 0, 255).astype(np.uint8)
+    out[image[..., 3] == 0] = 0
+    return out
+
+
+def adjust_brightness_contrast(image: np.ndarray, brightness: int = 0, contrast: int = 0) -> np.ndarray:
+    """Shift brightness (-255..255) and contrast (-255..255) using the standard
+    Photoshop-style contrast formula. Alpha is left untouched."""
+    rgb = image[..., :3].astype(np.float32) + brightness
+    contrast = max(-255, min(255, contrast))
+    factor = (259.0 * (contrast + 255.0)) / (255.0 * (259.0 - contrast))
+    rgb = factor * (rgb - 128.0) + 128.0
+    out = image.copy()
+    out[..., :3] = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+    out[image[..., 3] == 0] = 0
+    return out
+
+
+def invert_colors(image: np.ndarray) -> np.ndarray:
+    """Invert RGB channels, leaving alpha untouched."""
+    out = image.copy()
+    out[..., :3] = 255 - out[..., :3]
+    out[image[..., 3] == 0] = 0
+    return out
+
+
+def grayscale(image: np.ndarray) -> np.ndarray:
+    """Desaturate to luminance (Rec. 601 weights), preserving alpha."""
+    rgb = image[..., :3].astype(np.float32)
+    luma = rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114
+    out = image.copy()
+    out[..., :3] = np.clip(luma + 0.5, 0, 255).astype(np.uint8)[..., None]
+    out[image[..., 3] == 0] = 0
+    return out
+
+
 def apply_drop_shadow(
     image: np.ndarray,
     offset: tuple[int, int] = (2, 2),
